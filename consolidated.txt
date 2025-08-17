@@ -1,0 +1,568 @@
+from fastapi import HTTPException, APIRouter, Query
+from fastapi.responses import RedirectResponse
+import secrets
+import httpx
+
+from datetime import datetime, timedelta
+from typing import Dict, Optional
+from env_request_service import get_env_request_by_id
+from urllib.parse import quote
+
+
+# Configuration for different ML frameworks
+FRAMEWORK_CONFIGS = {
+    "xgboost": {
+        "base_url": "http://10.53.136.65:8888",
+        "token": "",
+        "notebook_path": "notebooks/xgboost_starter.ipynb"
+    },
+    "pytorch": {
+        "base_url": "http://10.53.136.65:8889",
+        "token": "",
+        "notebook_path": "notebooks/pytorch_starter.ipynb"
+    },
+    "tensorflow": {
+        "base_url": "http://10.53.136.65:8890",
+        "token": "",
+        "notebook_path": "notebooks/tensorflow_starter.ipynb"
+    },
+    "sklearn": {
+        "base_url": "http://10.53.136.65:8891",
+        "token": "",
+        "notebook_path": "notebooks/sklearn_starter.ipynb"
+    },
+    "keras": {
+        "base_url": "http://10.53.136.65:8892",
+        "token": "",
+        "notebook_path": "notebooks/keras_starter.ipynb"
+    },
+    "custom": {
+        "base_url": "http://10.53.136.65:8893",
+        "token": "",
+        "notebook_path": "notebooks/custom_starter.ipynb"
+    },
+    "default": {
+        "base_url": "http://10.53.136.65:8888",
+        "base_url": "http://10.53.136.65:8888",
+        "token": "",
+        "notebook_path": "notebooks/starter.ipynb"
+    }
+}
+
+PRESIGNED_URL_EXPIRY_MINUTES = 30
+
+# In-memory store for active presigned tokens (replace with Redis in production)
+active_presigned_tokens: Dict[str, dict] = {}
+
+class JupyterService:
+    """Service class for handling Jupyter-related operations"""
+
+    @staticmethod
+    def get_framework_config(framework: str) -> dict:
+        """Get configuration for a specific ML framework"""
+        framework_key = framework.lower() if framework else "default"
+        return FRAMEWORK_CONFIGS.get(framework_key, FRAMEWORK_CONFIGS["default"])
+
+    @staticmethod
+    def get_supported_frameworks() -> list:
+        """Get list of supported ML frameworks"""
+        return [fw for fw in FRAMEWORK_CONFIGS.keys() if fw != "default"]
+
+    @staticmethod
+    def validate_framework(framework: str) -> bool:
+        """Validate if the framework is supported"""
+        if not framework:
+            return True  # Default is allowed
+        return framework.lower() in FRAMEWORK_CONFIGS
+
+    @staticmethod
+    def generate_presigned_url(
+        request_id: str,
+        framework: str = None,
+        expiry_minutes: int = PRESIGNED_URL_EXPIRY_MINUTES
+    ) -> dict:
+        """Generate a secure presigned URL for Jupyter access with framework support"""
+        env_request = get_env_request_by_id(request_id)
+        if not env_request:
+            raise HTTPException(status_code=404, detail="Environment request not found")
+        raise HTTPException(status_code=404, detail="Environment request not found")
+    if env_request.ide_option != "jupyter":
+        raise HTTPException(status_code=400, detail="This environment request is not for Jupyter")
+
+    # Get framework from request if not provided
+    if not framework:
+        framework_options = getattr(env_request, 'framework_option', '')
+        if framework_options:
+            frameworks = [f.strip().lower() for f in framework_options.split(',')]
+            framework = frameworks[0] if frameworks else 'default'
+        else:
+            framework = 'default'
+
+    # Normalize framework name to lowercase
+    framework = framework.lower()
+
+    # Validate framework
+    if not JupyterService.validate_framework(framework):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported framework: {framework}. Supported frameworks: {JupyterService.get_supported_frameworks()}"
+        )
+
+    framework_config = JupyterService.get_framework_config(framework)
+    presigned_token = secrets.token_urlsafe(32)
+    expiry_time = datetime.utcnow() + timedelta(minutes=expiry_minutes)
+
+    active_presigned_tokens[presigned_token] = {
+        "request_id": request_id,
+        "env_name": env_request.env_name,
+        "framework": framework,
+        "framework_config": framework_config,
+        "requested_by": getattr(env_request, "requested_by", "anonymous"),
+        "created_at": datetime.utcnow(),
+        "expires_at": expiry_time,
+        "used_count": 0,
+        "last_accessed": None
+    }
+
+    presigned_url = f"http://10.53.136.65:5000/jupyter-access/{presigned_token}"
+
+    return {
+        "presigned_url": presigned_url,
+        "expires_at": expiry_time.isoformat()
+    }
+        "presigned_url": presigned_url,
+        "expires_at": expiry_time.isoformat(),
+        "expires_in_minutes": expiry_minutes,
+        "request_id": request_id,
+        "env_name": env_request.env_name,
+        "framework": framework,
+        "jupyter_base_url": framework_config["base_url"],
+        "notebook_path": framework_config["notebook_path"]
+    }
+
+    @staticmethod
+    def validate_and_access_jupyter(presigned_token: str) -> RedirectResponse:
+        """Validate presigned token and redirect to appropriate Jupyter framework container"""
+        if presigned_token not in active_presigned_tokens:
+            raise HTTPException(status_code=401, detail="Invalid presigned token")
+
+        token_info = active_presigned_tokens[presigned_token]
+        if datetime.utcnow() > token_info["expires_at"]:
+            del active_presigned_tokens[presigned_token]
+            raise HTTPException(status_code=401, detail="Presigned token has expired")
+
+        token_info["used_count"] += 1
+        token_info["last_accessed"] = datetime.utcnow()
+
+        # Get framework-specific configuration
+        framework_config = token_info["framework_config"]
+        jupyter_base_url = framework_config["base_url"]
+        notebook_path = framework_config["notebook_path"]
+
+        # Build the Jupyter URL with framework-specific token if available
+        framework_token = framework_config.get("token", "")
+        if framework_token:
+            jupyter_url = f"{jupyter_base_url}/lab/tree/{quote(notebook_path)}?token={framework_token}"
+        else:
+            jupyter_url = f"{jupyter_base_url}/lab/tree/{quote(notebook_path)}"
+
+        return RedirectResponse(url=jupyter_url, status_code=302)
+
+    @staticmethod
+    async def check_jupyter_health(framework: str = None) -> dict:
+        """Check if Jupyter service is running and accessible for a specific framework"""
+        if framework:
+            framework = framework.lower()
+        framework = framework.lower()
+
+        framework_config = JupyterService.get_framework_config(framework)
+        jupyter_base_url = framework_config["base_url"]
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{jupyter_base_url}/lab", timeout=5.0)
+                return {
+                    "framework": framework or "default",
+                    "jupyter_running": response.status_code == 200,
+                    "status": "healthy" if response.status_code == 200 else "unhealthy",
+                    "url": jupyter_base_url,
+                    "notebook_path": framework_config["notebook_path"]
+                }
+
+        except httpx.TimeoutException:
+            return {
+                "framework": framework or "default",
+                "jupyter_running": False,
+                "status": "timeout",
+                "error": "Jupyter service timeout",
+                "url": jupyter_base_url
+            }
+
+        except Exception as e:
+            return {
+                "framework": framework or "default",
+                "jupyter_running": False,
+                "status": "unhealthy",
+                "error": str(e),
+                "url": jupyter_base_url
+            }
+
+    @staticmethod
+    async def check_all_frameworks_health() -> dict:
+        """Check health of all framework containers"""
+        health_results = {}
+
+        for framework in FRAMEWORK_CONFIGS.keys():
+            health_results[framework] = await JupyterService.check_jupyter_health(framework)
+
+        healthy_count = sum(1 for result in health_results.values() if result["jupyter_running"])
+        total_count = len(health_results)
+        return {
+            "overall_status": "healthy" if healthy_count == total_count else "partial" if healthy_count > 0 else "unhealthy",
+            "healthy_frameworks": healthy_count,
+            "total_frameworks": total_count,
+            "frameworks": health_results
+        }
+
+    @staticmethod
+    def get_active_sessions() -> dict:
+        """Get information about active presigned tokens with framework info"""
+        now = datetime.utcnow()
+        active_sessions = []
+        expired_tokens = []
+
+        for token, info in active_presigned_tokens.items():
+            if now > info["expires_at"]:
+                expired_tokens.append(token)
+            else:
+                active_sessions.append({
+                    "token_preview": f"{token[:8]}...",
+                    "request_id": info["request_id"],
+                    "env_name": info["env_name"],
+                    "framework": info["framework"],
+                    "jupyter_url": info["framework_config"]["base_url"],
+                    "requested_by": info["requested_by"],
+                    "created_at": info["created_at"].isoformat(),
+                    "expires_at": info["expires_at"].isoformat(),
+                    "expires_in_minutes": int((info["expires_at"] - now).total_seconds() / 60),
+                    "used_count": info["used_count"],
+                    "last_accessed": info["last_accessed"].isoformat() if info["last_accessed"] else None
+                })
+
+        for token in expired_tokens:
+            del active_presigned_tokens[token]
+
+        return {
+            "active_sessions": len(active_sessions),
+            "expired_cleaned": len(expired_tokens),
+            "sessions": active_sessions
+        }
+    @staticmethod
+    def revoke_presigned_token(presigned_token: str) -> dict:
+        """Manually revoke a presigned token"""
+        if presigned_token not in active_presigned_tokens:
+            raise HTTPException(status_code=404, detail="Presigned token not found")
+
+        token_info = active_presigned_tokens[presigned_token]
+        del active_presigned_tokens[presigned_token]
+
+        return {
+            "success": True,
+            "message": "Presigned token revoked successfully",
+            "revoked_token_info": {
+                "request_id": token_info["request_id"],
+                "env_name": token_info["env_name"],
+                "framework": token_info["framework"],
+                "was_used": token_info["used_count"] > 0
+            }
+        }
+
+    @staticmethod
+    def cleanup_expired_tokens() -> dict:
+        """Clean up all expired tokens"""
+        now = datetime.utcnow()
+        expired_tokens = [token for token, info in active_presigned_tokens.items() if now > info["expires_at"]]
+
+        for token in expired_tokens:
+            del active_presigned_tokens[token]
+
+        return {
+            "cleaned_up": len(expired_tokens),
+            "remaining_active": len(active_presigned_tokens)
+        }
+
+class JupyterConfig:
+    """Configuration class for Jupyter settings"""
+
+    @staticmethod
+    def get_config() -> dict:
+        """Get current Jupyter configuration for all frameworks"""
+        return {
+            "frameworks": FRAMEWORK_CONFIGS,
+            "supported_frameworks": JupyterService.get_supported_frameworks()
+        }
+            "frameworks": FRAMEWORK_CONFIGS,
+            "supported_frameworks": JupyterService.get_supported_frameworks(),
+            "default_expiry_minutes": PRESIGNED_URL_EXPIRY_MINUTES,
+        }
+
+    @staticmethod
+    def get_framework_config(framework: str) -> dict:
+        """Get configuration for a specific framework"""
+        if not JupyterService.validate_framework(framework):
+            raise HTTPException(status_code=400, detail=f"Unsupported framework: {framework}")
+
+        return {
+            "framework": framework,
+            "config": JupyterService.get_framework_config(framework)
+        }
+
+    @staticmethod
+    def update_framework_config(framework: str, config_updates: dict) -> dict:
+        """Update configuration for a specific framework"""
+        if not JupyterService.validate_framework(framework):
+            raise HTTPException(status_code=400, detail=f"Unsupported framework: {framework}")
+
+        framework = framework.lower()
+        old_config = FRAMEWORK_CONFIGS[framework].copy()
+
+        # Update only allowed fields
+        allowed_fields = ["base_url", "token", "notebook_path"]
+        for field, value in config_updates.items():
+            if field in allowed_fields:
+                FRAMEWORK_CONFIGS[framework][field] = value
+
+        return {
+            "success": True,
+            "message": f"Configuration updated for {framework}",
+            "framework": framework,
+            "old_config": old_config,
+            "new_config": FRAMEWORK_CONFIGS[framework]
+        }
+    @staticmethod
+    def add_framework(framework: str, config: dict) -> dict:
+        """Add a new framework configuration"""
+        if framework.lower() in FRAMEWORK_CONFIGS:
+            raise HTTPException(status_code=400, detail=f"Framework {framework} already exists")
+
+        required_fields = ["base_url", "notebook_path"]
+        for field in required_fields:
+            if field not in config:
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+
+        # Set default token if not provided
+        if "token" not in config:
+            config["token"] = ""
+
+        FRAMEWORK_CONFIGS[framework.lower()] = config
+
+        return {
+            "success": True,
+            "message": f"Framework {framework} added successfully",
+            "framework": framework,
+            "config": config
+        }
+
+    @staticmethod
+    def remove_framework(framework: str) -> dict:
+        """Remove a framework configuration"""
+        if framework == "default":
+            raise HTTPException(status_code=400, detail="Cannot remove default framework")
+
+        if framework.lower() not in FRAMEWORK_CONFIGS:
+            raise HTTPException(status_code=404, detail=f"Framework {framework} not found")
+
+        removed_config = FRAMEWORK_CONFIGS.pop(framework.lower())
+
+        return {
+            "success": True,
+            "message": f"Framework {framework} removed successfully",
+            "removed_config": removed_config
+        }
+# FastAPI Router for API endpoints
+router = APIRouter()
+
+@router.post("/generate-jupyter-url/{request_id}")
+async def generate_jupyter_url(
+    request_id: str,
+    expiry_minutes: int = Query(30, ge=1, le=1440),
+    framework: str = Query(None, description="Override framework selection")
+):
+    """Generate presigned Jupyter URL for a specific framework"""
+    try:
+        env_request = get_env_request_by_id(request_id)
+        if not env_request:
+            raise HTTPException(status_code=404, detail="Environment request not found")
+
+        selected_framework = framework
+
+        if not selected_framework:
+            framework_options = getattr(env_request, 'framework_option', '')
+            if framework_options:
+                frameworks = [f.strip().lower() for f in framework_options.split(',')]
+                selected_framework = frameworks[0] if frameworks else 'default'
+            else:
+                selected_framework = 'default'
+
+        result = JupyterService.generate_presigned_url(
+            request_id=request_id,
+            framework=selected_framework,
+            expiry_minutes=expiry_minutes
+        )
+
+        return {
+            "success": True,
+            "message": "Jupyter URL generated successfully",
+            "data": result
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate Jupyter URL: {str(e)}")
+
+
+@router.post("/generate-jupyter-url/{request_id}/framework/{framework}")
+async def generate_jupyter_url_for_framework(
+    request_id: str,
+    framework: str,
+    expiry_minutes: int = Query(30, ge=1, le=1440)
+):
+    """Generate presigned Jupyter URL for a specific framework - explicit framework selection"""
+    try:
+        result = JupyterService.generate_presigned_url(
+            request_id=request_id,
+            framework=framework,
+            expiry_minutes=expiry_minutes
+        )
+
+        return {
+            "success": True,
+            "message": f"Jupyter URL generated for framework",
+            "data": result
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate Jupyter URL: {str(e)}")
+
+
+@router.get("/env-request/{request_id}/frameworks")
+async def get_available_frameworks(request_id: str):
+    """Get available frameworks for a specific environment request"""
+    try:
+        env_request = get_env_request_by_id(request_id)
+        if not env_request:
+            raise HTTPException(status_code=404, detail="Environment request not found")
+
+        framework_options = getattr(env_request, "framework_option", '')
+        framework_options = getattr(env_request, "framework_option", '')
+
+        if framework_options:
+            frameworks = [f.strip().lower() for f in framework_options.split(',')]
+
+            valid_frameworks = []
+            for fw in frameworks:
+                if JupyterService.validate_framework(fw):
+                    config = JupyterService.get_framework_config(fw)
+                    valid_frameworks.append({
+                        "name": fw,
+                        "display_name": fw.capitalize(),
+                        "base_url": config["base_url"],
+                        "notebook_path": config["notebook_path"]
+                    })
+
+            return {
+                "success": True,
+                "request_id": request_id,
+                "available_frameworks": valid_frameworks
+            }
+        else:
+            return {
+                "success": True,
+                "request_id": request_id,
+                "available_frameworks": []
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/jupyter-access/{presigned_token}")
+async def access_jupyter(presigned_token: str):
+    """Access Jupyter using presigned token"""
+    return JupyterService.validate_and_access_jupyter(presigned_token)
+
+
+@router.get("/jupyter/health")
+async def check_jupyter_health(framework: str = Query(None)):
+    """Check Jupyter health for a specific framework"""
+    return await JupyterService.check_jupyter_health(framework)
+@router.get("/jupyter/health")
+async def check_jupyter_health(framework: str = Query(None)):
+    """Check Jupyter health for a specific framework"""
+    return await JupyterService.check_jupyter_health(framework)
+
+
+@router.get("/jupyter/health/all")
+async def check_all_jupyter_health():
+    """Check health of all Jupyter framework containers"""
+    return await JupyterService.check_all_frameworks_health()
+
+
+@router.get("/jupyter/sessions")
+async def get_active_jupyter_sessions():
+    """Get all active Jupyter sessions"""
+    return JupyterService.get_active_sessions()
+
+
+@router.delete("/jupyter/session/{presigned_token}")
+async def revoke_jupyter_session(presigned_token: str):
+    """Revoke a specific Jupyter session"""
+    return JupyterService.revoke_presigned_token(presigned_token)
+
+
+@router.delete("/jupyter/sessions/expired")
+async def cleanup_expired_sessions():
+    """Clean up all expired Jupyter sessions"""
+    return JupyterService.cleanup_expired_tokens()
+
+
+@router.get("/jupyter/config")
+async def get_jupyter_config():
+    """Get Jupyter configuration"""
+    return JupyterConfig.get_config()
+
+
+@router.get("/jupyter/config/framework/{framework}")
+async def get_framework_config(framework: str):
+    """Get configuration for a specific framework"""
+    return JupyterConfig.get_framework_config(framework)
+@router.get("/jupyter/config")
+async def get_jupyter_config():
+    """Get Jupyter configuration"""
+    return JupyterConfig.get_config()
+
+
+@router.get("/jupyter/config/framework/{framework}")
+async def get_framework_config(framework: str):
+    """Get configuration for a specific framework"""
+    return JupyterConfig.get_framework_config(framework)
+
+
+@router.put("/jupyter/config/framework/{framework}")
+async def update_framework_config(framework: str, config_updates: dict):
+    """Update configuration for a specific framework"""
+    return JupyterConfig.update_framework_config(framework, config_updates)
+
+
+@router.post("/jupyter/config/framework/{framework}")
+async def add_framework_config(framework: str, config: dict):
+    """Add a new framework configuration"""
+    return JupyterConfig.add_framework(framework, config)
+
+
+@router.delete("/jupyter/config/framework/{framework}")
+async def remove_framework_config(framework: str):
+    """Remove a framework configuration"""
+    return JupyterConfig.remove_framework(framework)
